@@ -1,3 +1,10 @@
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Your JSX file must have type="text/babel" -->
+<script type="text/babel" src="app.jsx">
+
 import { useState, useCallback, useRef } from "react";
 
 const SAMPLE_HTML = `<section class="hero">
@@ -856,3 +863,4 @@ const styles = {
     fontFamily: "inherit",
   },
 };
+  </script>
