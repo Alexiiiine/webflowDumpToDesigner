@@ -1,0 +1,858 @@
+import { useState, useCallback, useRef } from "react";
+
+const SAMPLE_HTML = `<section class="hero">
+  <div class="container">
+    <h1 class="hero-title">Welcome to Our Site</h1>
+    <p class="hero-subtitle">Build something amazing today.</p>
+    <a href="/get-started" class="btn btn-primary">Get Started</a>
+  </div>
+</section>`;
+
+const SAMPLE_CSS = `.hero {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  background-color: #0f172a;
+  padding-top: 80px;
+  padding-bottom: 80px;
+}
+
+.container {
+  max-width: 960px;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 24px;
+  padding-right: 24px;
+  text-align: center;
+}
+
+.hero-title {
+  font-size: 48px;
+  font-weight: 700;
+  color: #f8fafc;
+  margin-bottom: 16px;
+  line-height: 1.1;
+}
+
+.hero-subtitle {
+  font-size: 20px;
+  color: #94a3b8;
+  margin-bottom: 32px;
+  line-height: 1.6;
+}
+
+.btn {
+  display: inline-block;
+  padding-top: 14px;
+  padding-bottom: 14px;
+  padding-left: 32px;
+  padding-right: 32px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 16px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background-color: #3b82f6;
+  color: #ffffff;
+}`;
+
+// ─── CSS Parser ──────────────────────────────────────────────
+function parseCSSRules(cssText) {
+  const rules = {};
+  // Remove comments
+  const cleaned = cssText.replace(/\/\*[\s\S]*?\*\//g, "");
+  // Match class selectors: .className { ... }
+  const ruleRegex = /\.([a-zA-Z0-9_-]+)\s*\{([^}]*)\}/g;
+  let match;
+  while ((match = ruleRegex.exec(cleaned)) !== null) {
+    const className = match[1];
+    const propsBlock = match[2].trim();
+    const props = {};
+    propsBlock.split(";").forEach((decl) => {
+      const d = decl.trim();
+      if (!d) return;
+      const colonIdx = d.indexOf(":");
+      if (colonIdx === -1) return;
+      const prop = d.slice(0, colonIdx).trim();
+      const val = d.slice(colonIdx + 1).trim();
+      if (prop && val) props[prop] = val;
+    });
+    if (Object.keys(props).length > 0) {
+      rules[className] = props;
+    }
+  }
+  return rules;
+}
+
+// ─── Inline Style Parser ────────────────────────────────────
+function parseInlineStyle(styleStr) {
+  const props = {};
+  if (!styleStr) return props;
+  styleStr.split(";").forEach((decl) => {
+    const d = decl.trim();
+    if (!d) return;
+    const colonIdx = d.indexOf(":");
+    if (colonIdx === -1) return;
+    const prop = d.slice(0, colonIdx).trim();
+    const val = d.slice(colonIdx + 1).trim();
+    if (prop && val) props[prop] = val;
+  });
+  return props;
+}
+
+// ─── Sanitize class name for Webflow style name ─────────────
+function sanitizeStyleName(name) {
+  return name.replace(/[^a-zA-Z0-9_]/g, "_");
+}
+
+// ─── Escape string for JS output ────────────────────────────
+function escStr(s) {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "");
+}
+
+// ─── Main Script Generator ──────────────────────────────────
+function generateWebflowScript(htmlInput, cssInput) {
+  // Parse CSS
+  const cssRules = parseCSSRules(cssInput);
+
+  // Parse HTML
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(
+    `<body>${htmlInput}</body>`,
+    "text/html"
+  );
+  const rootNodes = Array.from(doc.body.childNodes);
+
+  if (rootNodes.length === 0) {
+    return "// Error: No HTML elements found to convert.";
+  }
+
+  const lines = [];
+  const indent = (n) => "  ".repeat(n);
+  const createdStyles = new Set();
+  let inlineCounter = 0;
+
+  // Track all style creation lines (we'll hoist them)
+  const styleLines = [];
+  // Track all builder lines
+  const builderLines = [];
+
+  // ── Pre-create all CSS class styles ──────────────────────
+  for (const [className, props] of Object.entries(cssRules)) {
+    const safeName = sanitizeStyleName(className);
+    const varName = `style_${safeName}`;
+    createdStyles.add(className);
+    styleLines.push(
+      `${indent(1)}const ${varName} = await getOrCreate('${escStr(className)}');`
+    );
+    const propsStr = Object.entries(props)
+      .map(([k, v]) => `${indent(3)}'${escStr(k)}': '${escStr(v)}'`)
+      .join(",\n");
+    styleLines.push(`${indent(1)}await ${varName}.setProperties({`);
+    styleLines.push(propsStr);
+    styleLines.push(`${indent(1)}});`);
+    styleLines.push("");
+  }
+
+  // ── Recursive tree builder ───────────────────────────────
+  function processNode(node, parentVar, depthLevel) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent.trim();
+      if (!text) return;
+      // Text nodes are handled via setTextContent on the parent
+      // We'll skip standalone text; it's set during element creation
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const tag = node.tagName.toLowerCase();
+    const elVar = `el_${tag}_${Math.random().toString(36).slice(2, 7)}`;
+
+    // Create element via append on parent builder
+    builderLines.push(
+      `${indent(depthLevel)}const ${elVar} = ${parentVar}.append(webflow.elementPresets.DOM);`
+    );
+    builderLines.push(
+      `${indent(depthLevel)}${elVar}.setTag('${escStr(tag)}');`
+    );
+
+    // Handle class attribute → setStyles
+    const classAttr = node.getAttribute("class");
+    if (classAttr) {
+      const classes = classAttr
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((c) => c.trim());
+      const styleVars = [];
+
+      for (const cls of classes) {
+        const safeName = sanitizeStyleName(cls);
+        const varName = `style_${safeName}`;
+
+        // If this class wasn't in the CSS input, create an empty style for it
+        if (!createdStyles.has(cls)) {
+          createdStyles.add(cls);
+          styleLines.push(
+            `${indent(1)}const ${varName} = await getOrCreate('${escStr(cls)}');`
+          );
+          styleLines.push(
+            `${indent(1)}// Note: No CSS rules found for .${escStr(cls)} — add properties manually`
+          );
+          styleLines.push("");
+        }
+        styleVars.push(varName);
+      }
+
+      if (styleVars.length > 0) {
+        builderLines.push(
+          `${indent(depthLevel)}${elVar}.setStyles([${styleVars.join(", ")}]);`
+        );
+      }
+    }
+
+    // Handle inline style attribute → auto-named style
+    const inlineStyle = node.getAttribute("style");
+    if (inlineStyle) {
+      const props = parseInlineStyle(inlineStyle);
+      if (Object.keys(props).length > 0) {
+        const inlineName = `inline_${inlineCounter++}`;
+        const inlineVar = `style_${inlineName}`;
+        styleLines.push(
+          `${indent(1)}const ${inlineVar} = await getOrCreate('${inlineName}');`
+        );
+        const propsStr = Object.entries(props)
+          .map(([k, v]) => `${indent(3)}'${escStr(k)}': '${escStr(v)}'`)
+          .join(",\n");
+        styleLines.push(
+          `${indent(1)}await ${inlineVar}.setProperties({`
+        );
+        styleLines.push(propsStr);
+        styleLines.push(`${indent(1)}});`);
+        styleLines.push("");
+
+        // If the element already has class styles, we need to combine
+        const existingSetStyles = builderLines.findIndex(
+          (l) =>
+            l.includes(`${elVar}.setStyles(`) && l.includes(elVar)
+        );
+        if (existingSetStyles !== -1) {
+          // Replace the existing setStyles to include inline style
+          const oldLine = builderLines[existingSetStyles];
+          const newLine = oldLine.replace(
+            "]);",
+            `, ${inlineVar}]);`
+          );
+          builderLines[existingSetStyles] = newLine;
+        } else {
+          builderLines.push(
+            `${indent(depthLevel)}${elVar}.setStyles([${inlineVar}]);`
+          );
+        }
+      }
+    }
+
+    // Handle other attributes (skip class and style)
+    const attrs = node.attributes;
+    for (let i = 0; i < attrs.length; i++) {
+      const attr = attrs[i];
+      if (attr.name === "class" || attr.name === "style") continue;
+      builderLines.push(
+        `${indent(depthLevel)}${elVar}.setAttribute('${escStr(attr.name)}', '${escStr(attr.value)}');`
+      );
+    }
+
+    // Handle text content (only direct text, no child elements mixed)
+    const childNodes = Array.from(node.childNodes);
+    const hasElementChildren = childNodes.some(
+      (c) => c.nodeType === Node.ELEMENT_NODE
+    );
+    const textContent = childNodes
+      .filter((c) => c.nodeType === Node.TEXT_NODE)
+      .map((c) => c.textContent.trim())
+      .filter(Boolean)
+      .join(" ");
+
+    if (textContent && !hasElementChildren) {
+      builderLines.push(
+        `${indent(depthLevel)}${elVar}.setTextContent('${escStr(textContent)}');`
+      );
+    }
+
+    builderLines.push("");
+
+    // Recurse into children
+    childNodes.forEach((child) => {
+      processNode(child, elVar, depthLevel);
+    });
+  }
+
+  // Determine if we have a single root or multiple roots
+  const elementRoots = rootNodes.filter(
+    (n) => n.nodeType === Node.ELEMENT_NODE
+  );
+
+  if (elementRoots.length === 0) {
+    return "// Error: No HTML elements found to convert.";
+  }
+
+  // Build for each root element
+  for (const rootEl of elementRoots) {
+    const tag = rootEl.tagName.toLowerCase();
+    const rootVar = `root_${tag}_${Math.random().toString(36).slice(2, 7)}`;
+
+    builderLines.push(
+      `${indent(1)}// ── Build element tree ──`
+    );
+    builderLines.push(
+      `${indent(1)}const ${rootVar} = webflow.elementBuilder(webflow.elementPresets.DOM);`
+    );
+    builderLines.push(`${indent(1)}${rootVar}.setTag('${escStr(tag)}');`);
+
+    // Handle root classes
+    const classAttr = rootEl.getAttribute("class");
+    if (classAttr) {
+      const classes = classAttr.split(/\s+/).filter(Boolean);
+      const styleVars = classes.map((cls) => {
+        const safeName = sanitizeStyleName(cls);
+        if (!createdStyles.has(cls)) {
+          createdStyles.add(cls);
+          styleLines.push(
+            `${indent(1)}const style_${safeName} = await getOrCreate('${escStr(cls)}');`
+          );
+          styleLines.push(
+            `${indent(1)}// Note: No CSS rules found for .${escStr(cls)}`
+          );
+          styleLines.push("");
+        }
+        return `style_${safeName}`;
+      });
+      builderLines.push(
+        `${indent(1)}${rootVar}.setStyles([${styleVars.join(", ")}]);`
+      );
+    }
+
+    // Handle root inline style
+    const inlineStyle = rootEl.getAttribute("style");
+    if (inlineStyle) {
+      const props = parseInlineStyle(inlineStyle);
+      if (Object.keys(props).length > 0) {
+        const inlineName = `inline_${inlineCounter++}`;
+        const inlineVar = `style_${inlineName}`;
+        styleLines.push(
+          `${indent(1)}const ${inlineVar} = await getOrCreate('${inlineName}');`
+        );
+        const propsStr = Object.entries(props)
+          .map(([k, v]) => `${indent(3)}'${escStr(k)}': '${escStr(v)}'`)
+          .join(",\n");
+        styleLines.push(
+          `${indent(1)}await ${inlineVar}.setProperties({`
+        );
+        styleLines.push(propsStr);
+        styleLines.push(`${indent(1)}});`);
+        styleLines.push("");
+
+        const existingSetStyles = builderLines.findIndex((l) =>
+          l.includes(`${rootVar}.setStyles(`)
+        );
+        if (existingSetStyles !== -1) {
+          builderLines[existingSetStyles] = builderLines[
+            existingSetStyles
+          ].replace("]);", `, ${inlineVar}]);`);
+        } else {
+          builderLines.push(
+            `${indent(1)}${rootVar}.setStyles([${inlineVar}]);`
+          );
+        }
+      }
+    }
+
+    // Handle root attributes
+    const attrs = rootEl.attributes;
+    for (let i = 0; i < attrs.length; i++) {
+      const attr = attrs[i];
+      if (attr.name === "class" || attr.name === "style") continue;
+      builderLines.push(
+        `${indent(1)}${rootVar}.setAttribute('${escStr(attr.name)}', '${escStr(attr.value)}');`
+      );
+    }
+
+    // Handle root text content
+    const childNodes = Array.from(rootEl.childNodes);
+    const hasElementChildren = childNodes.some(
+      (c) => c.nodeType === Node.ELEMENT_NODE
+    );
+    const textContent = childNodes
+      .filter((c) => c.nodeType === Node.TEXT_NODE)
+      .map((c) => c.textContent.trim())
+      .filter(Boolean)
+      .join(" ");
+
+    if (textContent && !hasElementChildren) {
+      builderLines.push(
+        `${indent(1)}${rootVar}.setTextContent('${escStr(textContent)}');`
+      );
+    }
+
+    builderLines.push("");
+
+    // Process children
+    childNodes.forEach((child) => {
+      processNode(child, rootVar, 1);
+    });
+
+    // Append to selected element
+    builderLines.push(
+      `${indent(1)}// ── Insert into Webflow canvas ──`
+    );
+    builderLines.push(`${indent(1)}await selectedElement.append(${rootVar});`);
+    builderLines.push("");
+  }
+
+  // ── Assemble final script ──────────────────────────────
+  // Webflow Playground runs in an async context already,
+  // so we emit flat top-level await code with no IIFE wrapper.
+  // We also avoid optional chaining (?.) for parser compat.
+
+  lines.push("/**");
+  lines.push(" * Auto-generated Webflow Designer API Script");
+  lines.push(" * Paste this into the Webflow Designer API Playground");
+  lines.push(` * Generated: ${new Date().toISOString().split("T")[0]}`);
+  lines.push(" */");
+  lines.push("");
+  lines.push("// Get the currently selected element as insertion point");
+  lines.push("const selectedElement = await webflow.getSelectedElement();");
+  lines.push("if (!selectedElement || !selectedElement.children) {");
+  lines.push("  console.error('Please select a parent element in the Webflow Designer first.');");
+  lines.push("  throw new Error('No valid parent element selected.');");
+  lines.push("}");
+  lines.push("");
+  lines.push("// Helper: reuse existing style or create new one");
+  lines.push("async function getOrCreate(name) {");
+  lines.push("  var existing = await webflow.getStyleByName(name);");
+  lines.push("  if (existing) { return existing; }");
+  lines.push("  return await webflow.createStyle(name);");
+  lines.push("}");
+  lines.push("");
+  lines.push("// ── Create styles (CSS classes) ──");
+
+  // Strip the indent(1) prefix from generated lines since we're now top-level
+  const dedent = (arr) =>
+    arr.map((l) => (l.startsWith("  ") ? l.slice(2) : l));
+
+  lines.push(...dedent(styleLines));
+  lines.push(...dedent(builderLines));
+
+  lines.push("console.log('Done — elements created successfully.');");
+
+  return lines.join("\n");
+}
+
+// ─── React UI ────────────────────────────────────────────────
+export default function WebflowConverter() {
+  const [html, setHtml] = useState(SAMPLE_HTML);
+  const [css, setCss] = useState(SAMPLE_CSS);
+  const [output, setOutput] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [activeTab, setActiveTab] = useState("html");
+  const outputRef = useRef(null);
+
+  const handleGenerate = useCallback(() => {
+    try {
+      const script = generateWebflowScript(html, css);
+      setOutput(script);
+      setCopied(false);
+    } catch (e) {
+      setOutput(`// Error during conversion:\n// ${e.message}`);
+    }
+  }, [html, css]);
+
+  const handleCopy = useCallback(() => {
+    navigator.clipboard.writeText(output).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }, [output]);
+
+  const lineCount = (text) => text.split("\n").length;
+
+  return (
+    <div style={styles.root}>
+      {/* Header */}
+      <div style={styles.header}>
+        <div style={styles.headerLeft}>
+          <div style={styles.logoMark}>
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+              <path d="M3 14s1.5-5.5 5-5.5c0 0-1 5.5 2.5 5.5S14 8 14 8s0 6 3.5 6" stroke="#60a5fa" strokeWidth="2" strokeLinecap="round"/>
+              <circle cx="4" cy="5" r="1.5" fill="#60a5fa" opacity="0.6"/>
+              <circle cx="10" cy="3" r="1" fill="#60a5fa" opacity="0.4"/>
+            </svg>
+          </div>
+          <div>
+            <h1 style={styles.title}>HTML → Webflow Designer API</h1>
+            <p style={styles.subtitle}>Convert HTML & CSS into executable Webflow scripts</p>
+          </div>
+        </div>
+        <button style={styles.generateBtn} onClick={handleGenerate}>
+          <span style={{ marginRight: 6 }}>⚡</span>
+          Generate Script
+        </button>
+      </div>
+
+      {/* Main content */}
+      <div style={styles.main}>
+        {/* Input panel */}
+        <div style={styles.inputPanel}>
+          <div style={styles.tabBar}>
+            <button
+              style={{
+                ...styles.tab,
+                ...(activeTab === "html" ? styles.tabActive : {}),
+              }}
+              onClick={() => setActiveTab("html")}
+            >
+              <span style={styles.tabDot("#f97316")} />
+              HTML
+              <span style={styles.badge}>{lineCount(html)}L</span>
+            </button>
+            <button
+              style={{
+                ...styles.tab,
+                ...(activeTab === "css" ? styles.tabActive : {}),
+              }}
+              onClick={() => setActiveTab("css")}
+            >
+              <span style={styles.tabDot("#a78bfa")} />
+              CSS
+              <span style={styles.badge}>{lineCount(css)}L</span>
+            </button>
+          </div>
+
+          <div style={styles.editorWrap}>
+            {activeTab === "html" ? (
+              <textarea
+                style={styles.editor}
+                value={html}
+                onChange={(e) => setHtml(e.target.value)}
+                placeholder="Paste your HTML here..."
+                spellCheck="false"
+              />
+            ) : (
+              <textarea
+                style={styles.editor}
+                value={css}
+                onChange={(e) => setCss(e.target.value)}
+                placeholder="Paste your CSS here..."
+                spellCheck="false"
+              />
+            )}
+          </div>
+        </div>
+
+        {/* Output panel */}
+        <div style={styles.outputPanel}>
+          <div style={styles.outputHeader}>
+            <div style={styles.outputTitle}>
+              <span style={styles.tabDot("#34d399")} />
+              Generated Script
+              {output && (
+                <span style={styles.badge}>{lineCount(output)}L</span>
+              )}
+            </div>
+            {output && (
+              <button style={styles.copyBtn} onClick={handleCopy}>
+                {copied ? "✓ Copied" : "Copy"}
+              </button>
+            )}
+          </div>
+          <div style={styles.editorWrap}>
+            {output ? (
+              <textarea
+                ref={outputRef}
+                style={{ ...styles.editor, ...styles.outputEditor }}
+                value={output}
+                readOnly
+                spellCheck="false"
+              />
+            ) : (
+              <div style={styles.placeholder}>
+                <div style={styles.placeholderIcon}>
+                  <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+                    <rect x="4" y="6" width="32" height="28" rx="4" stroke="#334155" strokeWidth="1.5" fill="none"/>
+                    <path d="M12 18l4 4-4 4M20 26h8" stroke="#475569" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </div>
+                <p style={styles.placeholderText}>
+                  Click <strong>Generate Script</strong> to convert your HTML & CSS
+                </p>
+                <p style={styles.placeholderHint}>
+                  Output will be a ready-to-paste Webflow Designer API script
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Footer hints */}
+      <div style={styles.footer}>
+        <div style={styles.footerItem}>
+          <span style={styles.footerDot("#60a5fa")} />
+          Uses <code style={styles.code}>elementBuilder</code> for bulk creation
+        </div>
+        <div style={styles.footerItem}>
+          <span style={styles.footerDot("#a78bfa")} />
+          CSS classes → <code style={styles.code}>createStyle</code> + <code style={styles.code}>setProperties</code>
+        </div>
+        <div style={styles.footerItem}>
+          <span style={styles.footerDot("#f97316")} />
+          Inline styles → auto-named Webflow styles
+        </div>
+        <div style={styles.footerItem}>
+          <span style={styles.footerDot("#34d399")} />
+          Appends to selected element
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Styles ──────────────────────────────────────────────────
+const styles = {
+  root: {
+    fontFamily:
+      "'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', monospace",
+    background: "#0c0f1a",
+    color: "#e2e8f0",
+    minHeight: "100vh",
+    display: "flex",
+    flexDirection: "column",
+  },
+  header: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "16px 24px",
+    borderBottom: "1px solid #1e293b",
+    background: "linear-gradient(180deg, #111827 0%, #0c0f1a 100%)",
+  },
+  headerLeft: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+  },
+  logoMark: {
+    width: 36,
+    height: 36,
+    borderRadius: 8,
+    background: "rgba(96, 165, 250, 0.1)",
+    border: "1px solid rgba(96, 165, 250, 0.2)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  title: {
+    margin: 0,
+    fontSize: 15,
+    fontWeight: 600,
+    color: "#f1f5f9",
+    letterSpacing: "-0.01em",
+  },
+  subtitle: {
+    margin: 0,
+    fontSize: 11,
+    color: "#64748b",
+    fontWeight: 400,
+  },
+  generateBtn: {
+    background: "linear-gradient(135deg, #3b82f6, #2563eb)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 8,
+    padding: "10px 20px",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    display: "flex",
+    alignItems: "center",
+    boxShadow: "0 0 20px rgba(59, 130, 246, 0.3), inset 0 1px 0 rgba(255,255,255,0.1)",
+    transition: "all 0.15s ease",
+  },
+  main: {
+    display: "flex",
+    flex: 1,
+    minHeight: 0,
+  },
+  inputPanel: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    borderRight: "1px solid #1e293b",
+    minWidth: 0,
+  },
+  tabBar: {
+    display: "flex",
+    gap: 0,
+    borderBottom: "1px solid #1e293b",
+    background: "#111827",
+  },
+  tab: {
+    padding: "10px 20px",
+    background: "transparent",
+    border: "none",
+    borderBottom: "2px solid transparent",
+    color: "#64748b",
+    fontSize: 12,
+    fontWeight: 500,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    transition: "all 0.15s ease",
+  },
+  tabActive: {
+    color: "#e2e8f0",
+    borderBottomColor: "#3b82f6",
+    background: "rgba(59, 130, 246, 0.05)",
+  },
+  tabDot: (color) => ({
+    width: 6,
+    height: 6,
+    borderRadius: "50%",
+    background: color,
+    display: "inline-block",
+    flexShrink: 0,
+  }),
+  badge: {
+    fontSize: 10,
+    color: "#475569",
+    background: "#1e293b",
+    padding: "2px 6px",
+    borderRadius: 4,
+    fontWeight: 400,
+  },
+  editorWrap: {
+    flex: 1,
+    minHeight: 0,
+    position: "relative",
+  },
+  editor: {
+    width: "100%",
+    height: "100%",
+    boxSizing: "border-box",
+    background: "#0c0f1a",
+    color: "#cbd5e1",
+    border: "none",
+    padding: "16px 20px",
+    fontSize: 13,
+    lineHeight: 1.7,
+    fontFamily: "'JetBrains Mono', 'SF Mono', 'Fira Code', monospace",
+    resize: "none",
+    outline: "none",
+    tabSize: 2,
+    whiteSpace: "pre",
+    overflowX: "auto",
+  },
+  outputPanel: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    minWidth: 0,
+  },
+  outputHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "10px 20px",
+    borderBottom: "1px solid #1e293b",
+    background: "#111827",
+    minHeight: 41,
+  },
+  outputTitle: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 12,
+    fontWeight: 500,
+    color: "#e2e8f0",
+  },
+  outputEditor: {
+    color: "#93c5fd",
+  },
+  copyBtn: {
+    background: "#1e293b",
+    color: "#94a3b8",
+    border: "1px solid #334155",
+    borderRadius: 6,
+    padding: "5px 14px",
+    fontSize: 11,
+    fontWeight: 500,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    transition: "all 0.15s ease",
+  },
+  placeholder: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    height: "100%",
+    padding: 40,
+    textAlign: "center",
+  },
+  placeholderIcon: {
+    marginBottom: 16,
+    opacity: 0.5,
+  },
+  placeholderText: {
+    fontSize: 13,
+    color: "#475569",
+    margin: "0 0 6px 0",
+  },
+  placeholderHint: {
+    fontSize: 11,
+    color: "#334155",
+    margin: 0,
+  },
+  footer: {
+    display: "flex",
+    gap: 24,
+    padding: "12px 24px",
+    borderTop: "1px solid #1e293b",
+    background: "#111827",
+    flexWrap: "wrap",
+  },
+  footerItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 11,
+    color: "#64748b",
+  },
+  footerDot: (color) => ({
+    width: 5,
+    height: 5,
+    borderRadius: "50%",
+    background: color,
+    display: "inline-block",
+    flexShrink: 0,
+  }),
+  code: {
+    background: "#1e293b",
+    padding: "1px 5px",
+    borderRadius: 3,
+    fontSize: 10,
+    color: "#94a3b8",
+    fontFamily: "inherit",
+  },
+};
